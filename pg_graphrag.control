@@ -1,0 +1,7 @@
+comment = 'GraphRAG engine for PostgreSQL: provenance-first knowledge graph, permission-aware retrieval, temporal facts, PPR/Leiden/PathRAG in Rust'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_graphrag'
+relocatable = false
+superuser = true
+trusted = false
+requires = 'btree_gist'
