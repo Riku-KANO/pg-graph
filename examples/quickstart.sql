@@ -41,7 +41,7 @@ SELECT graphrag.ingest_extraction(c.id, x.extraction::jsonb)
   ) AS x(ext, extraction) ON x.ext = d.external_id;
 
 -- Canonical keys merged 株式会社ミナト製作所 / ミナト製作所 / ミナト製作所(株):
-SELECT name, canonical_key, aliases FROM graphrag.entity ORDER BY id;
+SELECT name, canonical_key, graphrag.entity_aliases(id) AS aliases FROM graphrag.entity ORDER BY id;
 SELECT source, rel_type, target, valid_from, valid_to FROM graphrag.fact ORDER BY id;
 
 -- 3. Multi-hop retrieval (PPR) — the question never mentions 横浜 or 神奈川 ----
@@ -74,8 +74,8 @@ SELECT graphrag.set_report('community', c.id, '山田花子の休職を含む、
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'analyst') THEN CREATE ROLE analyst NOLOGIN; END IF;
 END $$;
-SELECT graphrag.grant_reader('analyst');
 SELECT graphrag.enable_row_security();
+SELECT graphrag.grant_reader('analyst');
 SET ROLE analyst;
 -- the HR chunk, the 休職 entity and the report built on HR evidence are invisible
 SELECT rank, content FROM graphrag.local_search('demo', query => '山田花子 休職', top_k => 5);

@@ -13,98 +13,17 @@ use pgrx::prelude::*;
 use pgrx::JsonB;
 use serde_json::json;
 
-use super::common::{exec, get, graph_id, one, one_mut, rows, rows_mut};
+use super::common::{get, graph_id, one, one_mut, rows, rows_mut};
 
 fn forget(document_id: i64, clear_embeddings: bool) -> JsonB {
-    let info = rows(
-        "SELECT uid::text, graph_id FROM graphrag.document WHERE id = $1",
-        &[document_id.into()],
-        |row| {
-            Ok((
-                get::<String>(row, 1)?.unwrap(),
-                get::<i32>(row, 2)?.unwrap(),
-            ))
-        },
-    );
-    let Some((uid, gid)) = info.into_iter().next() else {
-        error!("graphrag: document {document_id} does not exist");
-    };
-    let chunks: Vec<i64> = rows(
-        "SELECT id FROM graphrag.chunk WHERE document_id = $1",
-        &[document_id.into()],
-        |row| get::<i64>(row, 1).map(|v| v.unwrap()),
-    );
-    let entities: Vec<i64> = rows(
-        "SELECT DISTINCT entity_id FROM graphrag.mention WHERE chunk_id = ANY($1)",
-        &[chunks.clone().into()],
-        |row| get::<i64>(row, 1).map(|v| v.unwrap()),
-    );
-    let relations: Vec<i64> = rows(
-        "SELECT DISTINCT relation_id FROM graphrag.relation_evidence WHERE chunk_id = ANY($1)",
-        &[chunks.clone().into()],
-        |row| get::<i64>(row, 1).map(|v| v.unwrap()),
-    );
-    // 1. LLM text derived from the erased evidence may quote it: delete it.
-    let reports = rows_mut(
-        "DELETE FROM graphrag.report
-          WHERE entity_id = ANY($1) OR relation_id = ANY($2)
-             OR community_id IN (SELECT community_id FROM graphrag.community_member WHERE entity_id = ANY($1))
-          RETURNING id",
-        &[entities.clone().into(), relations.clone().into()],
-        |row| get::<i64>(row, 1),
+    // The work happens in graphrag._erase_document (SECURITY DEFINER), so
+    // that derived objects hidden from the caller by row security are erased
+    // too; it checks that the caller may delete the document itself.
+    one_mut::<JsonB>(
+        "SELECT graphrag._erase_document($1, $2, current_user)",
+        &[document_id.into(), clear_embeddings.into()],
     )
-    .len();
-    // 2. The document; chunks, mentions and evidence cascade.
-    exec(
-        "DELETE FROM graphrag.document WHERE id = $1",
-        &[document_id.into()],
-    );
-    // 3. Facts that no longer have any evidence.
-    let orphan_relations = rows_mut(
-        "DELETE FROM graphrag.relation r
-          WHERE r.id = ANY($1) AND NOT r.is_curated
-            AND NOT EXISTS (SELECT 1 FROM graphrag.relation_evidence ev WHERE ev.relation_id = r.id)
-          RETURNING id",
-        &[relations.clone().into()],
-        |row| get::<i64>(row, 1),
-    )
-    .len();
-    let orphan_entities = rows_mut(
-        "DELETE FROM graphrag.entity e
-          WHERE e.id = ANY($1) AND NOT e.is_curated
-            AND NOT EXISTS (SELECT 1 FROM graphrag.mention m WHERE m.entity_id = e.id)
-            AND NOT EXISTS (SELECT 1 FROM graphrag.relation r WHERE (r.source_id = e.id OR r.target_id = e.id) AND r.is_curated)
-          RETURNING id",
-        &[entities.clone().into()],
-        |row| get::<i64>(row, 1),
-    )
-    .len();
-    // 4. Embeddings of surviving entities may encode erased descriptions.
-    let embeddings_cleared = if clear_embeddings {
-        rows_mut(
-            "UPDATE graphrag.entity SET embedding = NULL WHERE id = ANY($1) AND embedding IS NOT NULL RETURNING id",
-            &[entities.clone().into()],
-            |row| get::<i64>(row, 1),
-        )
-        .len()
-    } else {
-        0
-    };
-    let report = json!({
-        "document_uid": uid,
-        "chunks_deleted": chunks.len(),
-        "entities_touched": entities.len(),
-        "entities_deleted": orphan_entities,
-        "relations_touched": relations.len(),
-        "relations_deleted": orphan_relations,
-        "reports_deleted": reports,
-        "entity_embeddings_cleared": embeddings_cleared,
-    });
-    exec(
-        "INSERT INTO graphrag.erasure_log (graph_id, document_uid, report) VALUES ($1, $2::uuid, $3)",
-        &[gid.into(), uid.as_str().into(), JsonB(report.clone()).into()],
-    );
-    JsonB(report)
+    .unwrap_or_else(|| error!("graphrag: document {document_id} does not exist"))
 }
 
 /// Erase a document and everything derived from it (right to erasure).

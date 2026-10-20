@@ -96,8 +96,10 @@ pub fn collect_seeds(
         let k = ctx.opts.usize("embedding_seed_k", 5);
         let min = ctx.opts.f64("embedding_min_similarity", 0.3);
         let sql = format!(
-            "SELECT e.id, e.name, e.embedding FROM graphrag.entity e
-              WHERE e.graph_id = $1 AND e.embedding IS NOT NULL AND cardinality(e.embedding) = $2 AND {}",
+            "SELECT id, name, embedding FROM (
+                SELECT e.id, e.name, graphrag.entity_embedding(e.id) AS embedding FROM graphrag.entity e
+                 WHERE e.graph_id = $1 AND {}) s
+              WHERE cardinality(embedding) = $2",
             ctx.vis.entity("e")
         );
         let scored: Vec<((i64, String), f64)> =
@@ -130,12 +132,19 @@ pub fn collect_seeds(
         return seeds;
     }
     // Node specificity: down-weight entities mentioned in many chunks.
+    // Counted over visible chunks only: the weight is returned to the caller.
     let ids: Vec<i64> = seeds.iter().map(|s| s.entity_id).collect();
-    let df: HashMap<i64, i64> = rows(
-        "SELECT entity_id, count(*) FROM graphrag.mention WHERE entity_id = ANY($1) GROUP BY entity_id",
-        &[ids.into()],
-        |row| Ok((get::<i64>(row, 1)?.unwrap(), get::<i64>(row, 2)?.unwrap_or(0))),
-    )
+    let df_sql = format!(
+        "SELECT m.entity_id, count(*) FROM graphrag.mention m JOIN graphrag.chunk c ON c.id = m.chunk_id
+          WHERE m.entity_id = ANY($1) AND {} GROUP BY m.entity_id",
+        ctx.vis.chunk("c")
+    );
+    let df: HashMap<i64, i64> = rows(&df_sql, &[ids.into()], |row| {
+        Ok((
+            get::<i64>(row, 1)?.unwrap(),
+            get::<i64>(row, 2)?.unwrap_or(0),
+        ))
+    })
     .into_iter()
     .collect();
     for s in seeds.iter_mut() {
@@ -266,21 +275,26 @@ pub fn lexical_chunks(gid: i32, vis: &Vis, query: &str, k: usize) -> Vec<(i64, f
     if terms.is_empty() {
         return Vec::new();
     }
+    // Corpus statistics over the chunks the caller may see: counting hidden
+    // chunks would let scores reveal which terms restricted documents contain.
     let n_docs = one::<i64>(
-        "SELECT count(*) FROM graphrag.chunk WHERE graph_id = $1",
+        &format!(
+            "SELECT count(*) FROM graphrag.chunk c WHERE c.graph_id = $1 AND {}",
+            vis.chunk("c")
+        ),
         &[gid.into()],
     )
     .unwrap_or(0) as usize;
     if n_docs == 0 {
         return Vec::new();
     }
+    let df_sql = format!(
+        "SELECT count(*) FROM graphrag.chunk c WHERE c.graph_id = $1 AND c.lexemes @@ $2::tsquery AND {}",
+        vis.chunk("c")
+    );
     let mut df: HashMap<String, usize> = HashMap::new();
     for t in &terms {
-        let n = one::<i64>(
-            "SELECT count(*) FROM graphrag.chunk WHERE graph_id = $1 AND lexemes @@ $2::tsquery",
-            &[gid.into(), tsquery_literal(t).into()],
-        )
-        .unwrap_or(0) as usize;
+        let n = one::<i64>(&df_sql, &[gid.into(), tsquery_literal(t).into()]).unwrap_or(0) as usize;
         if n > 0 {
             df.insert(t.clone(), n);
         }
@@ -615,22 +629,34 @@ fn lexical_search(
     let vis = Vis::for_graph(gid);
     let hits = lexical_chunks(gid, &vis, query, top_k.max(1) as usize);
     let ids: Vec<i64> = hits.iter().map(|(c, _)| *c).collect();
-    let content: HashMap<i64, String> = rows(
-        "SELECT id, content FROM graphrag.chunk WHERE id = ANY($1)",
-        &[ids.into()],
-        |row| {
-            Ok((
-                get::<i64>(row, 1)?.unwrap(),
+    let sql = format!(
+        "SELECT c.id, c.content,
+                ARRAY(SELECT e.id FROM graphrag.mention m JOIN graphrag.entity e ON e.id = m.entity_id
+                       WHERE m.chunk_id = c.id AND {})
+           FROM graphrag.chunk c WHERE c.id = ANY($1)",
+        vis.entity("e")
+    );
+    let content: HashMap<i64, (String, Vec<i64>)> = rows(&sql, &[ids.into()], |row| {
+        Ok((
+            get::<i64>(row, 1)?.unwrap(),
+            (
                 get::<String>(row, 2)?.unwrap_or_default(),
-            ))
-        },
-    )
+                get::<Vec<i64>>(row, 3)?.unwrap_or_default(),
+            ),
+        ))
+    })
     .into_iter()
     .collect();
-    TableIterator::new(
-        hits.into_iter()
-            .filter_map(move |(c, s)| content.get(&c).map(|t| (c, s, t.clone()))),
-    )
+    let out: Vec<(i64, f64, String, Vec<i64>)> = hits
+        .into_iter()
+        .filter_map(|(c, s)| {
+            content
+                .get(&c)
+                .map(|(t, ents)| (c, s, t.clone(), ents.clone()))
+        })
+        .collect();
+    let out = filter_exposed(out, |h| h.3.clone(), gid);
+    TableIterator::new(out.into_iter().map(|(c, s, t, _)| (c, s, t)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1312,6 +1338,11 @@ fn build_context(
     for p in &path_hits {
         exposed_order.extend(p.entity_ids.iter().copied());
     }
+    // Community reports name their members, and seeds are returned by name.
+    for c in &communities {
+        exposed_order.extend(c.member_ids.iter().copied());
+    }
+    exposed_order.extend(r.seeds.iter().map(|s| s.entity_id));
     let admitted: Option<HashSet<i64>> = {
         let mut seen = HashSet::new();
         let order: Vec<i64> = exposed_order
@@ -1438,6 +1469,7 @@ fn build_context(
 
     let community_lines: Vec<(String, Value)> = communities
         .iter()
+        .filter(|c| c.member_ids.iter().all(&ok))
         .map(|c| {
             let title = c
                 .title
@@ -1481,6 +1513,7 @@ fn build_context(
     let seeds: Vec<Value> = r
         .seeds
         .iter()
+        .filter(|s| ok(&s.entity_id))
         .map(|s| json!({"id": s.entity_id, "name": s.name, "weight": s.weight, "via": s.source}))
         .collect();
     JsonB(json!({

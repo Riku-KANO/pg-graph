@@ -123,6 +123,13 @@ pub struct EntityInput<'a> {
 }
 
 /// Insert or merge an entity and record its mention in `chunk_id`.
+///
+/// With a chunk, what the extraction says about the entity (aliases, a
+/// differing surface form, description, embedding, metadata) is stored on
+/// the mention and is therefore visible exactly to the roles that may read
+/// the chunk. Only the name (on first insert) and the type label reach the
+/// entity row, which every role that can see the entity at all can read.
+/// Without a chunk the input is curated and merged into the entity row.
 pub fn upsert_entity_internal(gid: i32, e: &EntityInput) -> i64 {
     let name = e.name.trim();
     if name.is_empty() {
@@ -143,42 +150,74 @@ pub fn upsert_entity_internal(gid: i32, e: &EntityInput) -> i64 {
         .entity_type
         .map(|t| t.trim().to_uppercase())
         .filter(|t| !t.is_empty());
-    let id = one_mut::<i64>(
-        "INSERT INTO graphrag.entity AS e (graph_id, name, canonical_key, entity_type, aliases, embedding, metadata, is_curated)
-         VALUES ($1, $2, graphrag.canonical_key($2), $3, $4, $5, $6, $7)
+    let Some(cid) = e.chunk_id else {
+        return one_mut::<i64>(
+            "INSERT INTO graphrag.entity AS e (graph_id, name, canonical_key, entity_type, aliases, embedding, metadata, is_curated)
+             VALUES ($1, $2, graphrag.canonical_key($2), $3, $4, $5, $6, true)
+             ON CONFLICT (graph_id, canonical_key) DO UPDATE SET
+                entity_type = coalesce(e.entity_type, EXCLUDED.entity_type),
+                aliases = ARRAY(SELECT DISTINCT a FROM unnest(e.aliases || EXCLUDED.aliases
+                                  || CASE WHEN EXCLUDED.name <> e.name THEN ARRAY[EXCLUDED.name] ELSE '{}'::text[] END) AS a
+                                ORDER BY a),
+                embedding = coalesce(EXCLUDED.embedding, e.embedding),
+                metadata = e.metadata || EXCLUDED.metadata,
+                updated_at = now()
+             RETURNING id",
+            &[
+                gid.into(),
+                name.into(),
+                entity_type.into(),
+                e.aliases.clone().into(),
+                e.embedding.clone().into(),
+                JsonB(metadata).into(),
+            ],
+        )
+        .expect("entity id");
+    };
+    let (id, stored_name) = rows_mut(
+        "INSERT INTO graphrag.entity AS e (graph_id, name, canonical_key, entity_type)
+         VALUES ($1, $2, graphrag.canonical_key($2), $3)
          ON CONFLICT (graph_id, canonical_key) DO UPDATE SET
             entity_type = coalesce(e.entity_type, EXCLUDED.entity_type),
-            aliases = ARRAY(SELECT DISTINCT a FROM unnest(e.aliases || EXCLUDED.aliases
-                              || CASE WHEN EXCLUDED.name <> e.name THEN ARRAY[EXCLUDED.name] ELSE '{}'::text[] END) AS a
-                            ORDER BY a),
-            embedding = coalesce(EXCLUDED.embedding, e.embedding),
-            metadata = e.metadata || EXCLUDED.metadata,
             updated_at = now()
-         RETURNING id",
+         RETURNING id, name",
+        &[gid.into(), name.into(), entity_type.into()],
+        |row| {
+            Ok((
+                get::<i64>(row, 1)?.unwrap(),
+                get::<String>(row, 2)?.unwrap_or_default(),
+            ))
+        },
+    )
+    .into_iter()
+    .next()
+    .expect("entity id");
+    let mut aliases = e.aliases.clone();
+    if name != stored_name {
+        aliases.push(name.to_string());
+    }
+    exec(
+        "INSERT INTO graphrag.mention AS m (entity_id, chunk_id, description, aliases, embedding, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (entity_id, chunk_id) DO UPDATE SET
+            frequency = m.frequency + 1,
+            description = CASE
+                WHEN EXCLUDED.description IS NULL THEN m.description
+                WHEN m.description IS NULL THEN EXCLUDED.description
+                WHEN position(EXCLUDED.description IN m.description) > 0 THEN m.description
+                ELSE m.description || E'\\n' || EXCLUDED.description END,
+            aliases = ARRAY(SELECT DISTINCT a FROM unnest(m.aliases || EXCLUDED.aliases) AS a ORDER BY a),
+            embedding = coalesce(EXCLUDED.embedding, m.embedding),
+            metadata = m.metadata || EXCLUDED.metadata",
         &[
-            gid.into(),
-            name.into(),
-            entity_type.into(),
-            e.aliases.clone().into(),
+            id.into(),
+            cid.into(),
+            e.description.into(),
+            aliases.into(),
             e.embedding.clone().into(),
             JsonB(metadata).into(),
-            e.chunk_id.is_none().into(),
         ],
-    )
-    .expect("entity id");
-    if let Some(cid) = e.chunk_id {
-        exec(
-            "INSERT INTO graphrag.mention AS m (entity_id, chunk_id, description) VALUES ($1, $2, $3)
-             ON CONFLICT (entity_id, chunk_id) DO UPDATE SET
-                frequency = m.frequency + 1,
-                description = CASE
-                    WHEN EXCLUDED.description IS NULL THEN m.description
-                    WHEN m.description IS NULL THEN EXCLUDED.description
-                    WHEN position(EXCLUDED.description IN m.description) > 0 THEN m.description
-                    ELSE m.description || E'\\n' || EXCLUDED.description END",
-            &[id.into(), cid.into(), e.description.into()],
-        );
-    }
+    );
     id
 }
 
@@ -235,29 +274,59 @@ pub fn upsert_relation_internal(gid: i32, r: &RelationInput) -> Option<i64> {
     // Exclusive (functional) relations, e.g. "ceo_of" or "located_in": a new
     // fact closes the currently valid facts with the same source and type,
     // the way temporal knowledge graphs for agent memory (Zep / Graphiti)
-    // invalidate superseded edges instead of deleting them.
+    // invalidate superseded edges instead of deleting them. A fact is only
+    // closed when everyone who can see it may also read the new evidence
+    // (graphrag._may_supersede); otherwise a restricted document would change
+    // what other roles see, and reveal when the change happened.
     let mut valid_from = r.valid_from;
     if r.exclusive {
         if valid_from.is_none() {
             valid_from = one::<TimestampWithTimeZone>("SELECT now()", &[]);
         }
-        let closed = rows_mut(
-            "UPDATE graphrag.relation
-                SET valid_during = tstzrange(lower(valid_during), $5, '[)'), invalidated_at = now()
-              WHERE graph_id = $1 AND source_id = $2 AND rel_type = $3 AND target_id <> $4
-                AND valid_during @> $5 AND (lower(valid_during) IS NULL OR lower(valid_during) < $5)
-              RETURNING id",
+        let acl: Option<Vec<String>> = r.chunk_id.and_then(|cid| {
+            one::<Vec<String>>(
+                "SELECT acl FROM graphrag.chunk WHERE id = $1",
+                &[cid.into()],
+            )
+        });
+        let (closed, kept_open) = rows_mut(
+            "WITH cand AS (
+                SELECT id, graphrag._may_supersede(id, $6) AS ok FROM graphrag.relation
+                 WHERE graph_id = $1 AND source_id = $2 AND rel_type = $3 AND target_id <> $4
+                   AND valid_during @> $5 AND (lower(valid_during) IS NULL OR lower(valid_during) < $5)),
+             closed AS (
+                UPDATE graphrag.relation r
+                   SET valid_during = tstzrange(lower(r.valid_during), $5, '[)'), invalidated_at = now()
+                  FROM cand WHERE r.id = cand.id AND cand.ok
+                RETURNING r.id)
+             SELECT (SELECT count(*) FROM closed), (SELECT count(*) FROM cand WHERE NOT cand.ok)",
             &[
                 gid.into(),
                 src.into(),
                 rel_type.as_str().into(),
                 tgt.into(),
                 valid_from.into(),
+                acl.into(),
             ],
-            |row| get::<i64>(row, 1),
-        );
-        if !closed.is_empty() {
-            debug1!("graphrag: closed {} superseded relation(s)", closed.len());
+            |row| {
+                Ok((
+                    get::<i64>(row, 1)?.unwrap_or(0),
+                    get::<i64>(row, 2)?.unwrap_or(0),
+                ))
+            },
+        )
+        .into_iter()
+        .next()
+        .unwrap_or((0, 0));
+        if closed > 0 {
+            debug1!("graphrag: closed {closed} superseded relation(s)");
+        }
+        if kept_open > 0 {
+            notice!(
+                "graphrag: {kept_open} current \"{rel_type}\" relation(s) of \"{}\" left open: \
+                 roles that can see them may not read the new evidence",
+                r.source
+            );
         }
     }
 
