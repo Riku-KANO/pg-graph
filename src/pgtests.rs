@@ -14,6 +14,15 @@ mod tests {
         Spi::run(sql).unwrap_or_else(|e| panic!("{e}: {sql}"));
     }
 
+    /// Asserts that a PL/pgSQL statement fails with the given condition.
+    fn assert_fails(stmt: &str, condition: &str) {
+        run(&format!(
+            "DO $$ BEGIN {stmt}; RAISE EXCEPTION USING ERRCODE = 'GT001', MESSAGE = 'graphrag-test: succeeded: {}';
+             EXCEPTION WHEN {condition} THEN NULL; END $$",
+            stmt.replace('\'', "''")
+        ));
+    }
+
     fn chunk_of(external_id: &str) -> i64 {
         q::<i64>(&format!(
             "SELECT c.id FROM graphrag.chunk c JOIN graphrag.document d ON d.id = c.document_id WHERE d.external_id = '{external_id}'"
@@ -91,13 +100,14 @@ mod tests {
     #[pg_test]
     fn canonical_keys_dedupe_entities() {
         setup();
-        // 株式会社ミナト製作所 / ミナト製作所 / ミナト製作所(株) are one entity with aliases.
+        // 株式会社ミナト製作所 / ミナト製作所 / ミナト製作所(株) are one entity with aliases
+        // (recorded on the mentions of the chunks that used them).
         assert_eq!(
             q::<i64>("SELECT count(*) FROM graphrag.entity WHERE canonical_key = 'ミナト製作所'"),
             Some(1)
         );
         let aliases = q::<Vec<String>>(
-            "SELECT aliases FROM graphrag.entity WHERE canonical_key = 'ミナト製作所'",
+            "SELECT graphrag.entity_aliases(id) FROM graphrag.entity WHERE canonical_key = 'ミナト製作所'",
         )
         .unwrap();
         assert!(aliases.iter().any(|a| a.contains("(株)")), "{aliases:?}");
@@ -434,7 +444,7 @@ mod tests {
         );
         assert_eq!(
             q::<bool>(&format!(
-                "SELECT 'Minato Seisakusho' = ANY(aliases) FROM graphrag.entity WHERE id = {keep}"
+                "SELECT 'Minato Seisakusho' = ANY(graphrag.entity_aliases(id)) FROM graphrag.entity WHERE id = {keep}"
             )),
             Some(true)
         );
@@ -605,5 +615,227 @@ mod tests {
             q::<JsonB>("SELECT graphrag.stats('empty')").unwrap().0["entities"],
             0
         );
+    }
+
+    /// Extraction from a restricted chunk must not change what other roles
+    /// see about shared entities and facts.
+    #[pg_test]
+    fn restricted_extraction_stays_with_its_evidence() {
+        setup();
+        run("CREATE ROLE gr_alice NOLOGIN");
+        run("CREATE ROLE gr_bob NOLOGIN IN ROLE gr_hr");
+        run("SELECT graphrag.grant_reader('gr_alice'), graphrag.grant_reader('gr_bob')");
+        let hr = chunk_of("d4");
+        let hanako = entity_id("山田花子");
+        // The HR record names a successor and an internal alias.
+        run(&format!(
+            "SELECT graphrag.ingest_extraction({hr}, '{{\"entities\": [{{\"name\": \"山田花子\", \"aliases\": [\"人事コードH17\"]}}],
+               \"relations\": [{{\"source\": \"ミナト製作所\", \"target\": \"佐藤次郎\", \"type\": \"led_by\",
+                                 \"valid_from\": \"2026-12-01\", \"exclusive\": true}}]}}'::jsonb)"
+        ));
+        run(&format!(
+            "SELECT graphrag.upsert_entity('demo', '山田花子', chunk_id => {hr}, embedding => ARRAY[1, 0, 0]::real[])"
+        ));
+        // The public fact stays open; the restricted one is recorded next to it.
+        assert_eq!(
+            q::<bool>(
+                "SELECT upper_inf(r.valid_during) FROM graphrag.relation r JOIN graphrag.entity t ON t.id = r.target_id
+                  WHERE t.name = '山田花子' AND r.rel_type = 'led_by'"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            q::<i64>("SELECT count(*) FROM graphrag.fact WHERE target = '佐藤次郎'"),
+            Some(1)
+        );
+        // Nothing from the HR chunk reached the entity row.
+        assert_eq!(
+            q::<bool>(&format!(
+                "SELECT aliases = '{{}}' AND embedding IS NULL FROM graphrag.entity WHERE id = {hanako}"
+            )),
+            Some(true)
+        );
+        let probe = |role: &str| {
+            run(&format!("SET ROLE {role}"));
+            let alias = q::<bool>(&format!(
+                "SELECT '人事コードH17' = ANY(graphrag.entity_aliases({hanako}))"
+            ))
+            .unwrap();
+            let emb = q::<bool>(&format!(
+                "SELECT graphrag.entity_embedding({hanako}) IS NOT NULL"
+            ))
+            .unwrap();
+            let found = q::<i64>(
+                "SELECT count(*) FROM graphrag.match_entities('demo', ARRAY['人事コードH17'], min_score => 0.9)",
+            )
+            .unwrap();
+            let ctx = q::<String>(
+                "SELECT (graphrag.build_context('demo', seed_entities => ARRAY['ミナト製作所'], max_tokens => 3000))->>'context'",
+            )
+            .unwrap();
+            run("RESET ROLE");
+            (alias, emb, found, ctx)
+        };
+        let (alias, emb, found, ctx) = probe("gr_alice");
+        assert!(!alias && !emb && found == 0, "alice: {alias} {emb} {found}");
+        assert!(
+            !ctx.contains("2026-12-01") && !ctx.contains("佐藤次郎"),
+            "alice must not learn about the succession:\n{ctx}"
+        );
+        let (alias, emb, found, _) = probe("gr_bob");
+        assert!(alias && emb && found == 1, "bob: {alias} {emb} {found}");
+    }
+
+    #[pg_test]
+    fn chunk_acl_change_reaches_reports() {
+        setup();
+        let company = entity_id("ミナト製作所");
+        run(&format!(
+            "SELECT graphrag.set_report('entity', {company}, '横浜の精密機器メーカー')"
+        ));
+        // Restricting a single chunk (not its document) re-checks the report too.
+        run(&format!(
+            "UPDATE graphrag.chunk SET acl = ARRAY['gr_hr'] WHERE id = {}",
+            chunk_of("d1")
+        ));
+        let row = q::<String>(&format!("SELECT required_acls::text || ':' || stale FROM graphrag.report WHERE entity_id = {company}")).unwrap();
+        assert_eq!(row, r#"[["gr_hr"]]:true"#);
+        run("CREATE ROLE gr_alice NOLOGIN");
+        run("SELECT graphrag.grant_reader('gr_alice')");
+        run("SET ROLE gr_alice");
+        let ctx = q::<String>("SELECT (graphrag.build_context('demo', seed_entities => ARRAY['ミナト製作所'], max_tokens => 2000))->>'context'").unwrap();
+        run("RESET ROLE");
+        assert!(!ctx.contains("精密機器メーカー"), "{ctx}");
+    }
+
+    #[pg_test]
+    fn forget_document_is_complete_under_row_security() {
+        setup();
+        run("CREATE ROLE gr_legal NOLOGIN");
+        run("CREATE ROLE gr_officer NOLOGIN IN ROLE gr_hr");
+        run("CREATE ROLE gr_mallory NOLOGIN");
+        run("CREATE ROLE gr_alice NOLOGIN");
+        run("SELECT graphrag.grant_writer('gr_officer'), graphrag.grant_writer('gr_mallory'), graphrag.grant_reader('gr_alice')");
+        // A legal record about the same person: the entity report needs gr_hr and gr_legal.
+        run("SELECT graphrag.add_document('demo', content => '法務記録：山田花子と顧問契約を締結した。', external_id => 'd6', acl => ARRAY['gr_legal'])");
+        run(&format!(
+            "SELECT graphrag.ingest_extraction({}, '{{\"entities\": [{{\"name\": \"山田花子\", \"description\": \"顧問契約\"}}]}}'::jsonb)",
+            chunk_of("d6")
+        ));
+        let hanako = entity_id("山田花子");
+        run(&format!(
+            "SELECT graphrag.set_report('entity', {hanako}, '休職中。顧問契約あり。')"
+        ));
+        let d4 = q::<i64>("SELECT id FROM graphrag.document WHERE external_id = 'd4'").unwrap();
+        run("SELECT graphrag.enable_row_security()");
+
+        // Readers may not erase; writers may not erase what they cannot see.
+        run("SET ROLE gr_alice");
+        assert_fails(
+            &format!("PERFORM graphrag.forget_document({d4})"),
+            "insufficient_privilege",
+        );
+        run("SET ROLE gr_mallory");
+        assert_fails(
+            &format!("PERFORM graphrag.forget_document({d4})"),
+            "raise_exception",
+        );
+        run("RESET ROLE");
+
+        // The officer can read d4 but not the report (it also needs gr_legal);
+        // the report is erased all the same.
+        run("SET ROLE gr_officer");
+        let report = q::<JsonB>("SELECT graphrag.forget_document('demo', 'd4')")
+            .unwrap()
+            .0;
+        run("RESET ROLE");
+        assert_eq!(report["reports_deleted"], 1, "{report}");
+        assert_eq!(
+            q::<i64>(&format!(
+                "SELECT count(*) FROM graphrag.report WHERE entity_id = {hanako}"
+            )),
+            Some(0)
+        );
+        assert_eq!(
+            q::<String>("SELECT requested_by::text FROM graphrag.erasure_log"),
+            Some("gr_officer".into())
+        );
+    }
+
+    #[pg_test]
+    fn lexical_scores_ignore_hidden_chunks() {
+        setup();
+        run("CREATE ROLE gr_alice NOLOGIN");
+        run("SELECT graphrag.grant_reader('gr_alice')");
+        let d2 = chunk_of("d2");
+        let score = || {
+            run("SET ROLE gr_alice");
+            let s = q::<f64>(&format!(
+                "SELECT score FROM graphrag.lexical_search('demo', '代表取締役') WHERE chunk_id = {d2}"
+            ))
+            .unwrap();
+            run("RESET ROLE");
+            s
+        };
+        let before = score();
+        for i in 0..5 {
+            run(&format!(
+                "SELECT graphrag.add_document('demo', content => '人事：代表取締役の後任候補 {i}', external_id => 'hr{i}', acl => ARRAY['gr_hr'])"
+            ));
+        }
+        let after = score();
+        assert!(
+            (after - before).abs() < 1e-12,
+            "hidden chunks changed the score: {before} -> {after}"
+        );
+    }
+
+    #[pg_test]
+    fn membership_without_inherit_does_not_grant_access() {
+        setup();
+        run("CREATE ROLE gr_dave NOLOGIN");
+        run("GRANT gr_hr TO gr_dave WITH INHERIT FALSE");
+        run("SELECT graphrag.grant_reader('gr_dave')");
+        run("SET ROLE gr_dave");
+        let visible = q::<bool>("SELECT graphrag.acl_visible(ARRAY['gr_hr'])");
+        let ctx = q::<String>("SELECT (graphrag.build_context('demo', query => '山田花子の状況は？', max_tokens => 2000))->>'context'").unwrap();
+        run("RESET ROLE");
+        assert_eq!(visible, Some(false));
+        assert!(!ctx.contains("休職"), "{ctx}");
+    }
+
+    #[pg_test]
+    fn exposure_admit_cannot_probe_hidden_entities() {
+        setup();
+        run("CREATE ROLE gr_eve NOLOGIN");
+        run("SELECT graphrag.grant_reader('gr_eve')");
+        let hidden = entity_id("休職");
+        let gid = q::<i32>("SELECT id FROM graphrag.graph WHERE name = 'demo'").unwrap();
+        run("SET ROLE gr_eve");
+        // A hidden entity and an id that does not exist are both ignored
+        // (the latter used to fail with a foreign-key error).
+        let admitted = q::<Vec<i64>>(&format!(
+            "SELECT graphrag._exposure_admit({gid}, 'gr_eve', ARRAY[{hidden}, 9223372036854775807], 0)"
+        ));
+        run("RESET ROLE");
+        assert_eq!(admitted, Some(vec![]));
+        assert_eq!(q::<i64>("SELECT count(*) FROM graphrag.exposure"), Some(0));
+    }
+
+    #[pg_test]
+    fn maintenance_functions_are_not_for_readers() {
+        setup();
+        run("CREATE ROLE gr_alice NOLOGIN");
+        run("SELECT graphrag.grant_reader('gr_alice')");
+        run("SET ROLE gr_alice");
+        assert_fails(
+            "PERFORM graphrag.find_duplicates('demo')",
+            "insufficient_privilege",
+        );
+        assert_fails(
+            "PERFORM graphrag.community_context(1)",
+            "insufficient_privilege",
+        );
+        run("RESET ROLE");
     }
 }

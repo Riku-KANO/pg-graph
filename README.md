@@ -78,9 +78,9 @@ SELECT graphrag.build_context('demo', query => '山田花子が率いる会社�
 
 | 課題 | pg_graphrag の設計 |
 |---|---|
-| 権限漏洩 | **根拠ベースの可視性**: チャンクの ACL（PostgreSQL ロール名）から、エンティティ・関係・グラフ探索の可視性を導出します。LLM が書いた要約には、生成に使った全根拠の ACL 集合（`required_acls`）を記録し、そのすべてを満たすロールにだけ見せます。満たさない場合は要約を伏せ、見えるメンバーだけを返します（`visibility = 'redacted'`）。`enable_row_security()` で直接の SQL アクセスにも RLS をかけられます |
+| 権限漏洩 | **根拠ベースの可視性**: チャンクの ACL（PostgreSQL ロール名）から、エンティティ・関係・グラフ探索の可視性を導出します。LLM が書いた要約には、生成に使った全根拠の ACL 集合（`required_acls`）を記録し、そのすべてを満たすロールにだけ見せます。満たさない場合は要約を伏せ、見えるメンバーだけを返します（`visibility = 'redacted'`）。抽出結果がエンティティについて述べた内容（別名・説明・埋め込み・metadata）は言及の側に保存し、根拠のチャンクと同じ ACL で見せます。制限付き文書から来た排他的な事実は、それを読めないロールにも見えている事実を閉じません。`enable_row_security()` で直接の SQL アクセスにも RLS をかけられます |
 | 抽出攻撃 | **露出バジェット**: `graphrag.exposure_tracking` / `exposure_budget` を設定すると、ロールごとに開示済みのエンティティを記録し、グラフ全体に対する開示割合が上限を超えた時点で新しいエンティティを含む結果を返さなくなります。設定は superuser だけが変更できます |
-| 削除の権利 | **出典追跡による削除**: `forget_document()` は文書・チャンク・言及・根拠を削除し、根拠がなくなった事実と、削除内容を含み得る LLM 要約を消し、関連する埋め込みをクリアして、`erasure_log` に内容を含まない監査記録を残します |
+| 削除の権利 | **出典追跡による削除**: `forget_document()` は文書・チャンク・言及・根拠を削除し、根拠がなくなった事実と、削除内容を含み得る LLM 要約を消し、関連する埋め込みをクリアして、`erasure_log` に内容を含まない監査記録を残します。呼び出し側に RLS で見えない派生物も含めて消します |
 | 知識の鮮度 | **時間付きの事実**: 関係は有効期間 `valid_during tstzrange` を持ちます。PostgreSQL 18 の `UNIQUE (…, valid_during WITHOUT OVERLAPS)` が「同じ事実の有効期間は重ならない」ことを DB 制約として保証します。`exclusive => true` で登録すると、同じ主語・述語の現行事実を新事実の開始時点で閉じます（削除はしません）。すべての検索関数は `as_of` を受け取ります |
 | 索引コスト | **`lazy_index()`**: LLM を使わずにキーフレーズの共起グラフを作ります（LLM トークン 0）。**要約の再利用**: `build_communities()` はメンバー構成が変わらないコミュニティの要約を引き継ぎ、根拠が変わった要約はトリガで `stale` にします。`pending_report` ビューに出たものだけを LLM に送れば済みます |
 | 説明責任 | すべての事実に出典チャンクを紐付けます。コンテキストには `[#chunk_id]` 付きの出典が入り、`relational_paths()` は推論パスと根拠チャンクを返します。要約には `generated_by`（生成モデル名）を記録します |
@@ -128,9 +128,9 @@ flowchart LR
   Q -- "引用付きコンテキスト" --> A
 ```
 
-- **テーブル**: `graph`, `document`(uuidv7), `chunk`(ACL, lexemes, embedding), `entity`(canonical_key, aliases, key_grams), `mention`(エンティティ×チャンクと、そのチャンクでの記述), `relation`(valid_during, WITHOUT OVERLAPS), `relation_evidence`, `community`, `community_member`, `report`(LLM 生成文、required_acls, stale, generated_by), `exposure`, `erasure_log`
+- **テーブル**: `graph`, `document`(uuidv7), `chunk`(ACL, lexemes, embedding), `entity`(canonical_key, aliases, key_grams), `mention`(エンティティ×チャンクと、そのチャンクでの記述・別名・埋め込み・metadata), `relation`(valid_during, WITHOUT OVERLAPS), `relation_evidence`, `community`, `community_member`, `report`(LLM 生成文、required_acls, stale, generated_by), `exposure`, `erasure_log`
 - **ビュー**: `fact`（人が読める事実一覧）、`pending_report`（要約が必要な作業キュー）
-- **トリガ**: チャンクの ACL 継承と字句索引、エンティティのバイグラム索引、根拠の追加・削除による要約の `stale` 化（遷移テーブルを使う文単位トリガ）、文書 ACL の変更を `required_acls` に伝播
+- **トリガ**: チャンクの ACL 継承と字句索引、エンティティのバイグラム索引、根拠の追加・削除による要約の `stale` 化（遷移テーブルを使う文単位トリガ）、文書とチャンクの ACL の変更を `required_acls` に伝播
 - **Rust モジュール**: `text.rs`（日本語処理・BM25・チャンク分割）、`ppr.rs`、`leiden.rs`、`paths.rs`、`vector.rs` は PostgreSQL に依存しない純 Rust で単体テストできます。`api/` が SPI を介した SQL 関数です
 
 ## 5. ビルドとインストール
@@ -210,8 +210,8 @@ python examples/graphrag_pipeline.py ask     --graph docs --context-only "質問
 | `drop_graph(name)` → bool | グラフと中身をすべて削除します |
 | `add_document(graph, content, external_id, title, metadata, acl, source_uri, chunk_tokens=400, chunk_overlap=40)` → bigint | 文書を登録し、文境界を考慮してチャンクに分割します |
 | `add_chunk(document_id, content, ord, embedding)` → bigint | 自前で分割したチャンクを追加します |
-| `upsert_entity(graph, name, entity_type, description, chunk_id, embedding, aliases, metadata)` → bigint | エンティティを登録または統合します。`chunk_id` があれば出典付き、なければキュレーション済み（全員に可視）になります |
-| `upsert_relation(graph, source, target, rel_type, description, chunk_id, weight, valid_from, valid_to, exclusive, source_type, target_type)` → bigint | 関係を登録または補強します（端点がなければ作成）。`exclusive` で同種の現行事実を閉じます |
+| `upsert_entity(graph, name, entity_type, description, chunk_id, embedding, aliases, metadata)` → bigint | エンティティを登録または統合します。`chunk_id` があれば出典付きで、別名・説明・埋め込み・metadata は言及に保存します（そのチャンクを読めるロールにだけ見えます）。なければキュレーション済み（全員に可視）として、エンティティ自体に保存します |
+| `upsert_relation(graph, source, target, rel_type, description, chunk_id, weight, valid_from, valid_to, exclusive, source_type, target_type)` → bigint | 関係を登録または補強します（端点がなければ作成）。`exclusive` で同種の現行事実を閉じます。ただし、新しい根拠を読めないロールにも見えている事実は閉じず、NOTICE を出します |
 | `ingest_extraction(chunk_id, jsonb)` → jsonb | LLM の抽出結果をまとめて保存します。`name/entity_name`、`source/src_id`、`type/relation/relationship`、`weight/strength`、`valid_from/valid_at` などの表記ゆれを受け付けます |
 | `lazy_index(graph, document_id, max_phrases=12)` → jsonb | LLM なしでキーフレーズ共起グラフを作ります |
 
@@ -222,7 +222,8 @@ python examples/graphrag_pipeline.py ask     --graph docs --context-only "質問
 | `canonical_key(text)` | 正規化キー（`トヨタ自動車株式会社` / `トヨタ自動車(株)` / `トヨタ自動車㈱` → `トヨタ自動車`、`ＩＢＭ` / `IBM Corp.` → `ibm`） |
 | `name_similarity(a, b)` | Jaro–Winkler と文字バイグラム Dice の平均（CJK でも有効） |
 | `match_entities(graph, names[], min_score=0.6, per_name=3)` | GIN バイグラム索引を使うあいまい検索 |
-| `find_duplicates(graph, threshold=0.85, embedding_weight=0.3, max_pairs=100)` | 名前と埋め込みの類似度で重複候補を出します（型が違えば減点） |
+| `find_duplicates(graph, threshold=0.85, embedding_weight=0.3, max_pairs=100)` | 名前と埋め込みの類似度で重複候補を出します（型が違えば減点）。`grant_writer` を付けたロールだけが実行できます |
+| `entity_aliases(entity_id)` / `entity_embedding(entity_id)` | 呼び出し側に見える別名と埋め込み（キュレーション済みのものと、見える言及に記録されたもの） |
 | `merge_entities(keep_id, merge_ids[])` → jsonb | 言及・関係（有効期間と根拠を含む）・別名・埋め込みを統合し、自己ループを除きます |
 
 ### 検索
@@ -244,7 +245,7 @@ python examples/graphrag_pipeline.py ask     --graph docs --context-only "質問
 | 関数 | 説明 |
 |---|---|
 | `build_communities(graph, resolution=1.0, max_cluster_size=10, max_levels=3, seed=42, min_size=2)` → jsonb | 階層 Leiden を実行し、変わっていないコミュニティの要約を引き継ぎます |
-| `community_context(community_id, max_tokens=6000)` | LLM に渡す要約用の入力（下位コミュニティの要約、メンバー、内部関係） |
+| `community_context(community_id, max_tokens=6000)` | LLM に渡す要約用の入力（下位コミュニティの要約、メンバー、内部関係）。`grant_writer` を付けたロールだけが実行できます |
 | `set_report(kind, ref_id, content, title, embedding, generated_by)` | `entity` / `relation` / `community` の要約を保存し、`required_acls` を自動計算します |
 | ビュー `pending_report` | 要約がない、または古くなったものの一覧 |
 
@@ -252,24 +253,27 @@ python examples/graphrag_pipeline.py ask     --graph docs --context-only "質問
 
 | 関数 | 説明 |
 |---|---|
-| `forget_document(document_id, clear_embeddings=true)` / `forget_document(graph, external_id, …)` → jsonb | 文書と、そこから派生した知識を削除します |
+| `forget_document(document_id, clear_embeddings=true)` / `forget_document(graph, external_id, …)` → jsonb | 文書と、そこから派生した知識を削除します。呼び出し側には文書自体を消す権限（`graphrag.document` の DELETE と、RLS が有効なら文書の ACL）が必要です。派生物は、呼び出し側に見えないものも含めて削除します |
 | `invalidate_relation(relation_id, at)` | 事実の有効期間を閉じます（削除はしません） |
 | `enable_row_security()` | 直接の SQL アクセスにも根拠ベースの RLS をかけます |
-| `grant_reader(role)` / `grant_writer(role)` | アプリケーション用ロールに権限を付与します |
+| `grant_reader(role)` / `grant_writer(role)` | アプリケーション用ロールに権限を付与します。RLS が無効なときは、テーブルを直接読めてしまうことを WARNING で知らせます |
 | `exposure_report(graph)` / `reset_exposure(graph, principal)` | ロールごとの開示状況 |
 | `stats(graph)` → jsonb | 件数・古くなった要約・削除履歴など |
 
 ### ユーティリティ
 
-`lexical_tokens(text)`, `estimate_tokens(text)`, `extract_keyphrases(text, max)`, `chunk_text(text, max_tokens, overlap_tokens)`, `cosine_similarity(real[], real[])`, `acl_visible(text[])`, `acls_satisfied(jsonb)`
+`lexical_tokens(text)`, `estimate_tokens(text)`, `extract_keyphrases(text, max)`, `chunk_text(text, max_tokens, overlap_tokens)`, `cosine_similarity(real[], real[])`, `acl_is_public(text[])`, `acl_visible(text[])`, `acls_satisfied(jsonb)`
 
 ## 8. セキュリティモデル
 
-- **ACL ラベルは PostgreSQL のロール名です**。`acl IS NULL` または空配列は公開、`'public'` を含む場合も公開です。所属判定は `pg_has_role(…, 'MEMBER')` で行うため、ネストしたロールも DB 自身が判断します。superuser はすべてを見られます。
+- **ACL ラベルは PostgreSQL のロール名です**。`acl IS NULL` または空配列は公開、`'public'` を含む場合も公開です。所属判定は `pg_has_role(…, 'USAGE')` で行うため、ネストしたロールも DB 自身が判断します。PostgreSQL が権限を適用するときと同じく、`WITH INHERIT FALSE` の所属（CREATEROLE を持つロールが、自分の作ったロールに ADMIN だけで所属する場合など）は数えません。superuser はすべてを見られます。
 - **可視性の導出**: チャンク → （そのチャンクを根拠とする）言及・関係 → エンティティ・関係 → グラフ探索、の順に伝わります。エンティティと関係は、見える根拠が 1 つ以上あるか、キュレーション済み（チャンクなしで登録）の場合だけ見えます。PPR とパス探索は、見えない辺や見えない端点を一切たどりません。
-- **派生テキスト**（要約）は、生成に使った全根拠の ACL 集合 `required_acls` をすべて満たす場合だけ表示します。満たさない場合、エンティティの説明は見えるチャンクの記述だけから組み立て直し、コミュニティは伏せ字（`redacted`）にして見えるメンバーだけを返します。`required_acls` の計算は SECURITY DEFINER 関数で行うため、呼び出し側に RLS がかかっていても漏れなく集計されます。
-- **アプリケーションからの使い方**: 接続プールを使う場合は、リクエストごとに `SET LOCAL ROLE <end_user_role>` を実行してから検索関数を呼んでください。`enable_row_security()` を実行すると、テーブルを直接 `SELECT` しても同じ規則が適用されます（書き込みは `GRANT` で管理します）。RLS が有効な場合、閲覧者は存在自体が見えない要約を `no_report` として受け取ります。
-- **露出バジェット**: `exposure_tracking` と `exposure_budget` は `SUSET` パラメータなので、一般ロールは無効化できません。記録は SECURITY DEFINER 関数を通して行い、`session_user` が対象ロールになれることを検証します。
+- **抽出結果の属性は根拠の側に置きます**: チャンクから抽出した別名・説明・埋め込み・metadata は言及（`mention`）に保存し、そのチャンクを読めるロールにだけ見せます（`entity_aliases()` / `entity_embedding()`）。エンティティの行に残るのは、最初に登録された名前、型ラベル、キュレーション済みの属性だけです。そのため、公開の根拠を 1 つでも持つエンティティでも、制限付き文書の別名や埋め込みは他のロールに見えません。チャンクや文書の ACL を後から変えても、この規則はそのまま保たれます。
+- **排他的な事実の更新**: `exclusive` の関係が現行の事実を閉じるのは、閉じられる事実を見られるロール全員が、新しい根拠も読める場合だけです。そうでなければ、制限付き文書が他のロールに見える事実の有効期間を変え、いつ変わったかが漏れてしまいます。
+- **スコアの統計**: BM25 の文書数・文書頻度と、シードのノード特異性は、呼び出し側に見えるチャンクだけで数えます。見えない文書を数えると、スコアの変化から秘匿文書に含まれる語を推測できるためです。
+- **派生テキスト**（要約）は、生成に使った全根拠の ACL 集合 `required_acls` をすべて満たす場合だけ表示します。満たさない場合、エンティティの説明は見えるチャンクの記述だけから組み立て直し、コミュニティは伏せ字（`redacted`）にして見えるメンバーだけを返します。`required_acls` の計算は SECURITY DEFINER 関数で行うため、呼び出し側に RLS がかかっていても漏れなく集計されます。文書 ACL とチャンク ACL のどちらを変えても、影響する要約の `required_acls` を計算し直し、`stale` にします。
+- **アプリケーションからの使い方**: 接続プールを使う場合は、リクエストごとに `SET LOCAL ROLE <end_user_role>` を実行してから検索関数を呼んでください。`enable_row_security()` を実行すると、テーブルを直接 `SELECT` しても同じ規則が適用されます（書き込みは `GRANT` で管理します）。RLS が有効な場合、閲覧者は存在自体が見えない要約を `no_report` として受け取ります。RLS は表の所有者以外の全ロールにかかるため、自分が所属しない ACL の文書を取り込む書き込み用ロールには `BYPASSRLS` が必要です（または表の所有者で実行します）。
+- **露出バジェット**: `exposure_tracking` と `exposure_budget` は `SUSET` パラメータなので、一般ロールは無効化できません。記録は SECURITY DEFINER 関数を通して行い、`session_user` が対象ロールになれること（`SET` 権限）を検証します。その関数は、対象ロールに見えない ID や存在しない ID を無視するため、隠れたエンティティの存在確認には使えません。`local_search`・`rank_entities`・`relational_paths`・`subgraph`・`global_search`・`match_entities`・`lexical_search`・`build_context`（コミュニティ要約とシードを含む）が開示を記録します。グラフ全体を読む保守用の関数（`community_context`・`find_duplicates`）は、`grant_writer` を付けたロールだけが実行できます。
 
 ## 9. 設定パラメータ
 
@@ -283,10 +287,10 @@ python examples/graphrag_pipeline.py ask     --graph docs --context-only "質問
 
 ## 10. テスト
 
-`cargo pgrx test pg18` で 37 件のテストを実行し、すべて成功しています（PostgreSQL 18.6 で確認）。
+`cargo pgrx test pg18` で 44 件のテストを実行し、すべて成功しています（PostgreSQL 18.6 で確認）。
 
 - **純 Rust の単体テスト（21 件）**: 正規化キー（全角・半角、法人格、中点）、類似度、CJK バイグラム、キーフレーズ（日英、`AI倫理` のような英字と漢字の複合語）、トークン推定、チャンク分割、BM25、ローカルプッシュ PPR と厳密解（べき乗法）の一致、局所性、ノード上限、Leiden（2 つのクリーク、Zachary の空手クラブでモジュラリティ 0.40 超、全コミュニティの連結性、決定性、階層の整合性）、PathRAG のハブ枝刈りと向き
-- **DB 内の結合テスト（16 件）**: 名寄せと出典、PPR による多段検索（グラフ距離の順になること）、説明可能なパス、日本語 BM25、権限（RLS なしとあり、SET ROLE による 2 ロール比較、要約の伏せ字化）、時間（排他的な事実の無効化、`as_of`、WITHOUT OVERLAPS 違反の検出）、削除（派生知識と要約の削除、監査記録）、コミュニティ（要約の引き継ぎ、根拠追加による stale 化）、伏せ字化されたグローバル検索、重複検出と統合、LLM なし索引、密ベクトル検索、文書 ACL 変更の要約への伝播、コンテキストの出典と予算、露出バジェット
+- **DB 内の結合テスト（23 件）**: 名寄せと出典、PPR による多段検索（グラフ距離の順になること）、説明可能なパス、日本語 BM25、権限（RLS なしとあり、SET ROLE による 2 ロール比較、要約の伏せ字化）、時間（排他的な事実の無効化、`as_of`、WITHOUT OVERLAPS 違反の検出）、削除（派生知識と要約の削除、監査記録）、コミュニティ（要約の引き継ぎ、根拠追加による stale 化）、伏せ字化されたグローバル検索、重複検出と統合、LLM なし索引、密ベクトル検索、文書 ACL 変更の要約への伝播、コンテキストの出典と予算、露出バジェット。セキュリティの回帰テストとして、制限付き抽出が共有エンティティ・事実に漏れないこと、チャンク ACL 変更の要約への伝播、RLS 下での削除の完全性と権限、BM25 統計が見えない文書に影響されないこと、`INHERIT FALSE` の所属では読めないこと、露出記録関数で隠れたエンティティを探れないこと、保守用関数を閲覧ロールが呼べないこと
 
 ## 11. 制約と今後の課題
 
@@ -295,6 +299,7 @@ python examples/graphrag_pipeline.py ask     --graph docs --context-only "質問
 - **`lazy_index` のキーフレーズ抽出は文字種によるヒューリスティック**で、形態素解析は行いません。精度が必要な場合は、外部の形態素解析器や LLM の抽出結果を `ingest_extraction` に渡してください。
 - **トークン数は推定値**です（CJK は 1 文字 1 トークン、それ以外は 4 文字 1 トークン）。
 - **露出バジェットは開示済みエンティティの割合で数えます**。意味的に同等な言い換えや、複数ロールの結託は検出しません。
+- **エンティティの名前と型ラベル、関係の重みは根拠ごとに分けていません**。名前は最初に登録した表記、型は最初に付いたラベルで、関係の重みは見えない根拠の分も含めて加算されます。
 - **権限ごとに分けた要約**（ACL 区画ごとのコミュニティ要約）は未実装です。現状は、全根拠を満たすロールにだけ要約を見せる保守的な方式です。
 - このリポジトリでの対象は PostgreSQL 18 です（`uuidv7()` と `WITHOUT OVERLAPS` を使用）。
 

@@ -13,7 +13,7 @@ use pgrx::prelude::*;
 use pgrx::JsonB;
 use serde_json::json;
 
-use super::common::{exec, get, graph_id, one, one_mut, rows, rows_mut, Vis};
+use super::common::{exec, filter_exposed, get, graph_id, one, one_mut, rows, rows_mut, Vis};
 use crate::text::{self, canonical_key, char_ngrams, name_similarity};
 use crate::vector;
 
@@ -33,6 +33,19 @@ fn best_name_score(query: &str, name: &str, aliases: &[String]) -> f64 {
     best
 }
 
+/// Ids of the entities of graph `$1` whose key or curated aliases match
+/// `entity_cond` (over alias `e2`), plus those with an alias recorded in a
+/// visible mention whose bigrams overlap `grams`. Both sides use GIN indexes.
+fn candidates_sql(vis: &Vis, entity_cond: &str, grams: &str) -> String {
+    format!(
+        "SELECT e2.id FROM graphrag.entity e2 WHERE e2.graph_id = $1 AND ({entity_cond})
+         UNION
+         SELECT vk.entity_id FROM graphrag.mention vk JOIN graphrag.chunk vkc ON vkc.id = vk.chunk_id
+          WHERE vkc.graph_id = $1 AND vk.key_grams && {grams} AND {}",
+        vis.chunk("vkc")
+    )
+}
+
 /// Fuzzy-match names (e.g. entities found in a question by an LLM) against
 /// the graph, using the bigram GIN index for candidate generation.
 pub fn match_names(
@@ -44,10 +57,11 @@ pub fn match_names(
 ) -> Vec<Match> {
     let mut out = Vec::new();
     let sql = format!(
-        "SELECT e.id, e.name, e.aliases FROM graphrag.entity e
-          WHERE e.graph_id = $1 AND (e.canonical_key = $2 OR e.key_grams && $3) AND {}
+        "SELECT e.id, e.name, graphrag.entity_aliases(e.id) FROM graphrag.entity e
+          WHERE e.id IN ({}) AND {}
           ORDER BY (e.canonical_key = $2) DESC, e.id
           LIMIT 2000",
+        candidates_sql(vis, "e2.canonical_key = $2 OR e2.key_grams && $3", "$3"),
         vis.entity("e")
     );
     for (i, name) in names.iter().enumerate() {
@@ -119,9 +133,10 @@ pub fn match_query_text(gid: i32, vis: &Vis, query: &str, limit: usize) -> Vec<(
         return Vec::new();
     }
     let sql = format!(
-        "SELECT e.id, e.name, e.canonical_key, e.aliases FROM graphrag.entity e
-          WHERE e.graph_id = $1 AND e.key_grams && $2 AND {}
+        "SELECT e.id, e.name, e.canonical_key, graphrag.entity_aliases(e.id) FROM graphrag.entity e
+          WHERE e.id IN ({}) AND {}
           LIMIT 5000",
+        candidates_sql(vis, "e2.key_grams && $2", "$2"),
         vis.entity("e")
     );
     let cands = rows(&sql, &[gid.into(), grams.into()], |row| {
@@ -192,6 +207,7 @@ fn match_entities(
     let gid = graph_id(graph);
     let vis = Vis::for_graph(gid);
     let matches = match_names(gid, &vis, &names, min_score, per_name.max(1) as usize);
+    let matches = filter_exposed(matches, |m| vec![m.entity_id], gid);
     TableIterator::new(
         matches
             .into_iter()
@@ -225,7 +241,8 @@ fn find_duplicates(
     let vis = Vis::for_graph(gid);
     let ents = rows(
         &format!(
-            "SELECT e.id, e.name, e.canonical_key, e.aliases, e.entity_type, e.embedding
+            "SELECT e.id, e.name, e.canonical_key, graphrag.entity_aliases(e.id), e.entity_type,
+                    graphrag.entity_embedding(e.id)
                FROM graphrag.entity e WHERE e.graph_id = $1 AND {} ORDER BY e.id",
             vis.entity("e")
         ),
@@ -318,13 +335,26 @@ fn merge_entities(keep_id: i64, merge_ids: Vec<i64>) -> JsonB {
         if mg != gid {
             error!("graphrag: entity {m} belongs to a different graph than {keep_id}");
         }
-        // 1. mentions
+        // 1. mentions, with what each chunk said about the merged entity. Its
+        //    name becomes an alias of the kept entity: on the entity row if
+        //    it was curated, otherwise on its mentions, so the name stays
+        //    visible only to roles that could see the merged entity.
         exec(
-            "INSERT INTO graphrag.mention AS t (entity_id, chunk_id, description, frequency)
-             SELECT $1, chunk_id, description, frequency FROM graphrag.mention WHERE entity_id = $2
+            "INSERT INTO graphrag.mention AS t (entity_id, chunk_id, description, frequency, aliases, embedding, metadata)
+             SELECT $1, mm.chunk_id, mm.description, mm.frequency,
+                    mm.aliases || CASE WHEN d.is_curated OR graphrag.canonical_key(d.name) = k.canonical_key
+                                       THEN '{}'::text[] ELSE ARRAY[d.name] END,
+                    mm.embedding, mm.metadata
+               FROM graphrag.mention mm
+               JOIN graphrag.entity d ON d.id = mm.entity_id
+               JOIN graphrag.entity k ON k.id = $1
+              WHERE mm.entity_id = $2
              ON CONFLICT (entity_id, chunk_id) DO UPDATE SET
                 frequency = t.frequency + EXCLUDED.frequency,
-                description = concat_ws(E'\\n', t.description, EXCLUDED.description)",
+                description = concat_ws(E'\\n', t.description, EXCLUDED.description),
+                aliases = ARRAY(SELECT DISTINCT a FROM unnest(t.aliases || EXCLUDED.aliases) AS a ORDER BY a),
+                embedding = coalesce(t.embedding, EXCLUDED.embedding),
+                metadata = EXCLUDED.metadata || t.metadata",
             &[keep_id.into(), m.into()],
         );
         // 2. relations
@@ -391,10 +421,12 @@ fn merge_entities(keep_id: i64, merge_ids: Vec<i64>) -> JsonB {
                 }
             }
         }
-        // 3. names, aliases, curation, embedding, metadata
+        // 3. curated aliases (and the name of a curated entity), curation,
+        //    embedding, metadata
         exec(
             "UPDATE graphrag.entity k SET
-                aliases = ARRAY(SELECT DISTINCT a FROM unnest(k.aliases || d.aliases || ARRAY[d.name]) AS a
+                aliases = ARRAY(SELECT DISTINCT a FROM unnest(k.aliases || d.aliases
+                                  || CASE WHEN d.is_curated THEN ARRAY[d.name] ELSE '{}'::text[] END) AS a
                                  WHERE graphrag.canonical_key(a) <> k.canonical_key ORDER BY a),
                 is_curated = k.is_curated OR d.is_curated,
                 embedding = coalesce(k.embedding, d.embedding),
